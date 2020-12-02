@@ -1,45 +1,52 @@
 package main
 
 import (
-	"fmt"
-	"encoding/json"
-	"net/http"
-	"log"
-	"strconv"
-	elastic "gopkg.in/olivere/elastic.v3"
- 	"github.com/pborman/uuid"
-	"reflect"
 	"context"
-	"cloud.google.com/go/storage"
+	"encoding/json"
+	"fmt"
 	"io"
+	"log"
+	"net/http"
+	"reflect"
+	"strconv"
+
+	"cloud.google.com/go/storage"
+
+	"github.com/pborman/uuid"
+	elastic "gopkg.in/olivere/elastic.v3"
+
+	jwtmiddleware "github.com/auth0/go-jwt-middleware"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
 )
 
-type Location struct{
+type Location struct {
 	Lat float64 `json:"lat"`
 	Lon float64 `json:"lon"`
 }
 
-type Post struct{
-	User string `json:"user"`
-	Message string `json:"message"`
+type Post struct {
+	User     string   `json:"user"`
+	Message  string   `json:"message"`
 	Location Location `json:"location"`
-	Url string `json:"url"`
+	Url      string   `json:"url"`
 }
 
 const (
-	INDEX = "around"
-	TYPE = "post"
-	DISTANCE = "200km"
-	ES_URL = "http://34.121.246.114:9200"
+	INDEX       = "around"
+	TYPE        = "post"
+	DISTANCE    = "200km"
+	ES_URL      = "http://34.66.86.174:9200"
 	BUCKET_NAME = "post-images-297200"
 )
+
+var mySigningKey = []byte("secret")
 
 func main() {
 	// fmt.Println("Started Service")
 	// http.HandleFunc("/post", handlerPost)
 	// http.HandleFunc("/search", handlerSearch)
 	// log.Fatal(http.ListenAndServe(":8080", nil))
-
 
 	// Create a client
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
@@ -73,54 +80,68 @@ func main() {
 		}
 	}
 	fmt.Println("started-service")
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
+
+	r := mux.NewRouter()
+	var jwtMiddleWare = jwtmiddleware.New(jwtmiddleware.Options{
+		ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			return mySigningKey, nil
+		},
+		SigningMethod: jwt.SigningMethodHS256,
+	})
+
+	r.Handle("/post", jwtMiddleWare.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleWare.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+
+	http.Handle("/", r)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func handlerPost(w http.ResponseWriter, r *http.Request) {
 	// Other codes
-   w.Header().Set("Content-Type", "application/json")
-   w.Header().Set("Access-Control-Allow-Origin", "*")
-   w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
-
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
 
 	// 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
 	// After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
 	// If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
 	r.ParseMultipartForm(32 << 20)
-
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
 	// Parse from form data.
 	fmt.Printf("Received one post request %s\n", r.FormValue("message"))
 	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
 	p := &Post{
-		   User:    "1111",
-		   Message: r.FormValue("message"),
-		   Location: Location{
-				  Lat: lat,
-				  Lon: lon,
-		   },
+		User:    username.(string),
+		Message: r.FormValue("message"),
+		Location: Location{
+			Lat: lat,
+			Lon: lon,
+		},
 	}
 
 	id := uuid.New()
 
 	file, _, err := r.FormFile("image")
 	if err != nil {
-		   http.Error(w, "Image is not available", http.StatusInternalServerError)
-		   fmt.Printf("Image is not available %v.\n", err)
-		   return
+		http.Error(w, "Image is not available", http.StatusInternalServerError)
+		fmt.Printf("Image is not available %v.\n", err)
+		return
 	}
 	defer file.Close()
 
 	ctx := context.Background()
 
-   // replace it with your real bucket name.
+	// replace it with your real bucket name.
 	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
 	if err != nil {
-		   http.Error(w, "GCS is not setup", http.StatusInternalServerError)
-		   fmt.Printf("GCS is not setup %v\n", err)
-		   return
+		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+		fmt.Printf("GCS is not setup %v\n", err)
+		return
 	}
 
 	// Update the media link after saving to GCS.
@@ -134,7 +155,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func saveToGCS(ctx context.Context, r io.Reader, BUCKET_NAME string, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error){
+func saveToGCS(ctx context.Context, r io.Reader, BUCKET_NAME string, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -142,35 +163,35 @@ func saveToGCS(ctx context.Context, r io.Reader, BUCKET_NAME string, name string
 	defer client.Close()
 
 	bucket := client.Bucket(BUCKET_NAME)
-	if _, err = bucket.Attrs(ctx); err != nil{
+	if _, err = bucket.Attrs(ctx); err != nil {
 		return nil, nil, err
 	}
 
 	obj := bucket.Object(name)
 	w := obj.NewWriter(ctx)
-	if _, err:=io.Copy(w,r); err!=nil{
+	if _, err := io.Copy(w, r); err != nil {
 		return nil, nil, err
 	}
 
-	if err := w.Close(); err!=nil{
+	if err := w.Close(); err != nil {
 		return nil, nil, err
 	}
 
-	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err!=nil {
+	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
 		return nil, nil, err
 	}
 
 	attrs, err := obj.Attrs(ctx)
 	fmt.Printf("Post is saved to GCS %s\n", attrs.MediaLink)
-	return obj, attrs, err	
+	return obj, attrs, err
 }
 
-func saveToES(p *Post, id string){
-	es_client , err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
-	if err!= nil{
+func saveToES(p *Post, id string) {
+	es_client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
+	if err != nil {
 		panic(err)
 	}
-	
+
 	_, e := es_client.Index().
 		Index(INDEX).
 		Type(TYPE).
@@ -178,7 +199,7 @@ func saveToES(p *Post, id string){
 		BodyJson(p).
 		Refresh(true).
 		Do()
-	if e!=nil {
+	if e != nil {
 		panic(e)
 	}
 
@@ -186,41 +207,41 @@ func saveToES(p *Post, id string){
 
 }
 
-func handlerSearch(w http.ResponseWriter, r *http.Request){
+func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Received one request from search")
-	lat , _ := strconv.ParseFloat(r.URL.Query().Get("lat"),64)
-	lon , _ := strconv.ParseFloat(r.URL.Query().Get("lon"),64)
+	lat, _ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.URL.Query().Get("lon"), 64)
 	ran := DISTANCE
-	if val := r.URL.Query().Get("range"); val!=""{
-		ran = val + "km";
+	if val := r.URL.Query().Get("range"); val != "" {
+		ran = val + "km"
 	}
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
-	if  err!= nil{
+	if err != nil {
 		panic(err)
 	}
-	q:= elastic.NewGeoDistanceQuery("location")
-	q= q.Distance(ran).Lat(lat).Lon(lon)
+	q := elastic.NewGeoDistanceQuery("location")
+	q = q.Distance(ran).Lat(lat).Lon(lon)
 	searchResult, err := client.Search().Index(INDEX).Query(q).Pretty(true).Do()
 
-	if err!=nil{
+	if err != nil {
 		panic(err)
 	}
 
 	fmt.Println("Query took %d milliseconds\n", searchResult.TookInMillis)
-	fmt.Printf("Found a total of %d posts \n" , searchResult.TotalHits())
+	fmt.Printf("Found a total of %d posts \n", searchResult.TotalHits())
 
 	var typ Post
 	var ps []Post
 
-	for _, item := range searchResult.Each(reflect.TypeOf(typ)){
+	for _, item := range searchResult.Each(reflect.TypeOf(typ)) {
 		p := item.(Post)
-		fmt.Printf("Post by %s: %s at lat %v and lon %v \n", 
-		p.User, p.Message, p.Location.Lat, p.Location.Lon)
+		fmt.Printf("Post by %s: %s at lat %v and lon %v \n",
+			p.User, p.Message, p.Location.Lat, p.Location.Lon)
 		ps = append(ps, p)
 	}
 
 	js, err := json.Marshal(ps)
-	if err != nil{
+	if err != nil {
 		panic(err)
 	}
 
