@@ -15,6 +15,7 @@ import (
 	"github.com/pborman/uuid"
 	elastic "gopkg.in/olivere/elastic.v3"
 
+	"cloud.google.com/go/bigtable"
 	jwtmiddleware "github.com/auth0/go-jwt-middleware"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
@@ -38,6 +39,8 @@ const (
 	DISTANCE    = "200km"
 	ES_URL      = "http://34.66.86.174:9200"
 	BUCKET_NAME = "post-images-297200"
+	PROJECT_ID  = "around-297200"
+	BT_INSTANCE = "around-post"
 )
 
 var mySigningKey = []byte("secret")
@@ -151,7 +154,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	saveToES(p, id)
 
 	// Save to BigTable.
-	//saveToBigTable(p, id)
+	saveToBigTable(p, id)
 
 }
 
@@ -187,6 +190,47 @@ func saveToGCS(ctx context.Context, r io.Reader, BUCKET_NAME string, name string
 }
 
 func saveToES(p *Post, id string) {
+	es_client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
+	if err != nil {
+		panic(err)
+	}
+
+	_, e := es_client.Index().
+		Index(INDEX).
+		Type(TYPE).
+		Id(id).
+		BodyJson(p).
+		Refresh(true).
+		Do()
+	if e != nil {
+		panic(e)
+	}
+
+	fmt.Printf("Post is saved to index %s \n", p.Message)
+
+}
+
+func saveToBigTable(p *Post, id string) {
+	ctx := context.Background()
+	bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE)
+	if err != nil {
+		panic(err)
+		return
+	}
+	tbl := bt_client.Open("post")
+	mut := bigtable.NewMutation()
+	t := bigtable.Now()
+	mut.Set("post", "user", t, []byte(p.User))
+	mut.Set("post", "message", t, []byte(p.Message))
+	mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+	mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+	err = tbl.Apply(ctx, id, mut)
+	if err != nil {
+		panic(err)
+		return
+	}
+	fmt.Printf("PostissavedtoBigTable:%s\n", p.Message)
+
 	es_client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
 		panic(err)
